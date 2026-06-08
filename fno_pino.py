@@ -20,7 +20,14 @@ class SpectralConv1d(nn.Module):
         return x
 
 class PINO1d(nn.Module):
-    def __init__(self, in_dim=5, out_dim=1, width=64, modes=1, num_layers=3):
+    def __init__(
+        self,
+        in_dim=5,
+        out_dim=1,
+        width=128,
+        modes=8,
+        num_layers=6
+    ):
         super(PINO1d, self).__init__()
         self.width = width
         self.fc0 = nn.Linear(in_dim, self.width)
@@ -45,7 +52,11 @@ class PINO1d(nn.Module):
         x = self.fc2(x)
         return x
 
-def compute_pino_loss(model, x_raw, num_points=8):
+def compute_pino_loss(
+    model,
+    x_raw,
+    num_points=32
+):
     device = x_raw.device
     batch_size = x_raw.shape[0]
     
@@ -53,7 +64,12 @@ def compute_pino_loss(model, x_raw, num_points=8):
     r = x_raw[:, 3:4]
     sigma = x_raw[:, 4:5]
     
-    s_space = torch.linspace(0.0, 200.0, num_points, device=device)
+    s_space = torch.linspace(
+        0.0,
+        1000.0,
+        num_points,
+        device=device
+    )
     tau_space = torch.linspace(0.001, 2.0, num_points, device=device)
     S_mesh, tau_mesh = torch.meshgrid(s_space, tau_space, indexing='ij')
     
@@ -98,7 +114,10 @@ def compute_pino_loss(model, x_raw, num_points=8):
     V_low = model(inp_low)
     boundary_loss_low = torch.mean(V_low ** 2)
     
-    S_high = torch.full_like(tau_bound, 200.0)
+    S_high = torch.full_like(
+        tau_bound,
+        1000.0
+    )
     inp_high = torch.cat([S_high, K_bound, tau_bound, r_bound, sigma_bound], dim=-1)
     V_high = model(inp_high)
     discounted_strike = K_bound * torch.exp(-r_bound * tau_bound)

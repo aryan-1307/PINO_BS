@@ -10,7 +10,7 @@ def black_scholes_call(S, K, T, r, sigma):
     d2 = d1 - sigma * np.sqrt(T)
     return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
-def make_dataset(num_labeled=40000, num_collocation=20000):
+def make_dataset(num_labeled=40000, num_collocation=100000):
     np.random.seed(42)
     os.makedirs('data/generated', exist_ok=True)
     
