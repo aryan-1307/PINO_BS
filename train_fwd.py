@@ -35,11 +35,11 @@ def train():
 
     model = PINO2d(modes1=16, modes2=16, width=64, num_layers=4).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
 
     batch_size = 32
     epochs = 500
-    physics_weight = 0.1
+    physics_weight = 0.01
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 

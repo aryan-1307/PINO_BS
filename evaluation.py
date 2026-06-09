@@ -58,6 +58,7 @@ def run_evaluation():
     X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
     with torch.no_grad():
         fwd_preds = fwd_model(X_tensor, S_grid, T_grid).cpu().numpy()
+        fwd_preds = fwd_preds * 1000.0
 
     # 1. Surface-level forward operator metrics
     fwd_metrics = compute_extended_metrics(Y_test, fwd_preds)

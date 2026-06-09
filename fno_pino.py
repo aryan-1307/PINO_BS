@@ -62,6 +62,12 @@ class PINO2d(nn.Module):
         r = r.expand_as(K)
         sigma = sigma.expand_as(K)
 
+K = K / 1000.0
+r = r / 0.10
+sigma = sigma / 1.0
+S = S / 1000.0
+T = T / 3.0
+
         x = torch.stack([K, r, sigma, S, T], dim=-1)
         x = self.fc0(x)
         x = x.permute(0, 3, 1, 2)

@@ -30,7 +30,7 @@ def make_dataset(num_surfaces=1000, grid_size=64):
         sigma = np.random.uniform(0.05, 1.0)
         price_surface = black_scholes_call(S_mesh, K, T_mesh, r, sigma)
         inputs.append([K, r, sigma])
-        surfaces.append(price_surface.astype(np.float32))
+        surfaces.append((price_surface / 1000.0).astype(np.float32))
 
     inputs = np.array(inputs, dtype=np.float32)
     surfaces = np.array(surfaces, dtype=np.float32)
