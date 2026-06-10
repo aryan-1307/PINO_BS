@@ -2,122 +2,180 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from fno_pino import PINO2d, compute_pino_loss
+from fno_pino import PINO2d, compute_pino_loss, relative_l2_loss
 
 
 def train():
-    if not os.path.exists('data/generated/surface_inputs.npy') or \
-       not os.path.exists('data/generated/surface_outputs.npy'):
-        print("Required surface training datasets are missing. Please run generate_data.py first.")
+    dataset_path = 'data/generated/dataset.npz'
+    if not os.path.exists(dataset_path):
+        print("Dataset missing. Run generate_data.py first.")
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
 
-    X_data = np.load('data/generated/surface_inputs.npy')
-    Y_data = np.load('data/generated/surface_outputs.npy')
+    data = np.load(dataset_path)
+    X_raw    = data['inputs']      # (N, 3)   [K, r, sigma]  — raw
+    Y_raw    = data['surfaces']    # (N, 64, 64)              — raw prices
+    S_grid   = data['S_grid']      # (64,)  physical values
+    T_grid   = data['T_grid']      # (64,)  physical values
+    param_min = data['param_min']  # (3,)
+    param_max = data['param_max']  # (3,)
+    V_scale   = float(data['V_scale'][0])
 
-    X_tensor = torch.tensor(X_data, dtype=torch.float32)
-    Y_tensor = torch.tensor(Y_data, dtype=torch.float32)
+    # ------------------------------------------------------------------
+    # Normalise inputs and outputs
+    # ------------------------------------------------------------------
+    # Params → [0, 1]
+    X_norm = (X_raw - param_min) / (param_max - param_min + 1e-8)
 
-    grid_size = 64
-    # T starts at 0.0 — must match generate_data.py exactly
-    s_space = np.linspace(1.0, 1000.0, grid_size)
-    t_space = np.linspace(0.0, 3.0, grid_size)
-    S_mesh, T_mesh = np.meshgrid(s_space, t_space, indexing='ij')
+    # Surfaces → [0, 1]  (divide by V_scale = S_max = 1000)
+    Y_norm = Y_raw / V_scale
 
-    S_grid = torch.tensor(S_mesh, dtype=torch.float32).to(device)
-    T_grid = torch.tensor(T_mesh, dtype=torch.float32).to(device)
+    X_tensor = torch.tensor(X_norm, dtype=torch.float32)
+    Y_tensor = torch.tensor(Y_norm, dtype=torch.float32)
+
+    # Raw params kept on CPU for physics loss (PDE coefficients need physical values)
+    X_raw_tensor = torch.tensor(X_raw, dtype=torch.float32)
+
+    # Physical 1D grids on device for FD stencils and BC targets
+    S_grid_1d = torch.tensor(S_grid, dtype=torch.float32).to(device)
+    T_grid_1d = torch.tensor(T_grid, dtype=torch.float32).to(device)
+
+    # Normalised 2D grids for model input channels
+    S_norm = (S_grid - S_grid.min()) / (S_grid.max() - S_grid.min())
+    T_norm = (T_grid - T_grid.min()) / (T_grid.max() - T_grid.min())
+    S_mesh_n, T_mesh_n = np.meshgrid(S_norm, T_norm, indexing='ij')
+    S_grid_2d_n = torch.tensor(S_mesh_n, dtype=torch.float32).to(device)
+    T_grid_2d_n = torch.tensor(T_mesh_n, dtype=torch.float32).to(device)
+
+    V_scale_t = torch.tensor(V_scale, dtype=torch.float32).to(device)
 
     split = int(0.8 * len(X_tensor))
-    X_train, X_val = X_tensor[:split], X_tensor[split:]
-    Y_train, Y_val = Y_tensor[:split], Y_tensor[split:]
+    X_train_n,   X_val_n   = X_tensor[:split],     X_tensor[split:]
+    Y_train_n,   Y_val_n   = Y_tensor[:split],     Y_tensor[split:]
+    X_train_raw, X_val_raw = X_raw_tensor[:split], X_raw_tensor[split:]
 
     model = PINO2d(modes1=16, modes2=16, width=64, num_layers=4).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    batch_size = 32
-    epochs = 500
-    physics_weight = 0.01
+    batch_size  = 32
+    epochs      = 500
+    grad_clip   = 1.0
+    lambda_pde  = 1.0
+    lambda_ic   = 10.0
+    lambda_bc   = 10.0
+    pde_warmup  = 50
+    pde_ramp    = 50
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
+    os.makedirs('outputs', exist_ok=True)
+    best_val_loss = float('inf')
     history = []
-    print("Starting Forward PINO Training...")
 
-    for epoch in range(epochs):
+    print("Starting PINO Training (normalised inputs/outputs)...")
+    print(f"  Train: {len(X_train_n)} | Val: {len(X_val_n)}")
+    print(f"  V_scale={V_scale:.1f} | param ranges: {param_min} -> {param_max}")
+    print(f"  PDE warmup={pde_warmup} | ramp={pde_ramp}")
+
+    for epoch in range(1, epochs + 1):
+        if epoch <= pde_warmup:
+            curr_lambda_pde = 0.0
+        elif epoch <= pde_warmup + pde_ramp:
+            curr_lambda_pde = lambda_pde * (epoch - pde_warmup) / pde_ramp
+        else:
+            curr_lambda_pde = lambda_pde
+
         model.train()
-        perm = torch.randperm(X_train.size(0))
-        num_samples = X_train.size(0)
-        steps = int(np.ceil(num_samples / batch_size))
+        perm        = torch.randperm(len(X_train_n))
+        num_samples = len(X_train_n)
+        steps       = int(np.ceil(num_samples / batch_size))
 
-        epoch_loss = epoch_data = epoch_pde = 0.0
+        ep_total = ep_data = ep_pde = ep_ic = ep_bc = 0.0
 
         for step in range(steps):
-            start = step * batch_size
-            end = min(start + batch_size, num_samples)
-            idx = perm[start:end]
+            i0  = step * batch_size
+            i1  = min(i0 + batch_size, num_samples)
+            idx = perm[i0:i1]
 
-            batch_params = X_train[idx].to(device)
-            batch_y = Y_train[idx].to(device)
+            # Normalised params for model input
+            bp_n   = X_train_n[idx].to(device)
+            # Raw params for physics (PDE coefficients)
+            bp_raw = X_train_raw[idx].to(device)
+            by_n   = Y_train_n[idx].to(device)
 
             optimizer.zero_grad()
 
-            preds = model(batch_params, S_grid, T_grid)
-            loss_data = torch.mean((preds - batch_y) ** 2)
-            loss_pde = compute_pino_loss(model, batch_params, S_grid, T_grid)
-            loss = loss_data + physics_weight * loss_pde
+            V_pred_n = model(bp_n, S_grid_2d_n, T_grid_2d_n)   # (B, 64, 64), normalised
 
+            l_data = relative_l2_loss(V_pred_n, by_n)
+
+            l_phys, l_pde, l_ic, l_bc = compute_pino_loss(
+                V_pred_n, bp_raw, S_grid_1d, T_grid_1d, V_scale_t,
+                lambda_pde=curr_lambda_pde,
+                lambda_ic=lambda_ic,
+                lambda_bc=lambda_bc
+            )
+
+            loss = l_data + l_phys
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
 
-            n = end - start
-            epoch_loss += loss.item() * n
-            epoch_data += loss_data.item() * n
-            epoch_pde += loss_pde.item() * n
+            n = i1 - i0
+            ep_total += loss.item()   * n
+            ep_data  += l_data.item() * n
+            ep_pde   += l_pde.item()  * n
+            ep_ic    += l_ic.item()   * n
+            ep_bc    += l_bc.item()   * n
 
-        epoch_loss /= num_samples
-        epoch_data /= num_samples
-        epoch_pde /= num_samples
+        ep_total /= num_samples
+        ep_data  /= num_samples
+        ep_pde   /= num_samples
+        ep_ic    /= num_samples
+        ep_bc    /= num_samples
 
+        # Validation
         model.eval()
         val_accum = 0.0
-        num_val = X_val.size(0)
-        val_steps = int(np.ceil(num_val / batch_size))
+        num_val   = len(X_val_n)
 
         with torch.no_grad():
-            for v in range(val_steps):
+            for v in range(int(np.ceil(num_val / batch_size))):
                 vs = v * batch_size
                 ve = min(vs + batch_size, num_val)
-                bx = X_val[vs:ve].to(device)
-                by = Y_val[vs:ve].to(device)
-                val_preds = model(bx, S_grid, T_grid)
-                val_accum += torch.mean((val_preds - by) ** 2).item() * (ve - vs)
+                vp = model(
+                    X_val_n[vs:ve].to(device),
+                    S_grid_2d_n, T_grid_2d_n
+                )
+                val_accum += relative_l2_loss(vp, Y_val_n[vs:ve].to(device)).item() * (ve - vs)
 
-        val_loss = val_accum / num_val if num_val > 0 else 0.0
+        val_loss = val_accum / num_val
 
-        print(
-            f"Epoch {epoch+1:03d}/{epochs} | "
-            f"Loss: {epoch_loss:.6f} | "
-            f"Data: {epoch_data:.6f} | "
-            f"PDE: {epoch_pde:.6f} | "
-            f"Val: {val_loss:.6f}"
-        )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'outputs/fwd_model_best.pth')
 
         scheduler.step()
+
+        print(
+            f"Ep {epoch:03d}/{epochs} | "
+            f"total={ep_total:.4f} data={ep_data:.4f} "
+            f"pde={ep_pde:.5f} ic={ep_ic:.5f} bc={ep_bc:.5f} | "
+            f"val={val_loss:.4f} best={best_val_loss:.4f} lam_pde={curr_lambda_pde:.2f}"
+        )
+
         history.append({
-            'epoch': epoch + 1,
-            'train_loss': epoch_loss,
-            'data_loss': epoch_data,
-            'pde_loss': epoch_pde,
-            'val_loss': val_loss
+            'epoch': epoch, 'train_loss': ep_total, 'data_loss': ep_data,
+            'pde_loss': ep_pde, 'ic_loss': ep_ic, 'bc_loss': ep_bc,
+            'val_loss': val_loss, 'lambda_pde': curr_lambda_pde
         })
 
-    os.makedirs('outputs', exist_ok=True)
     pd.DataFrame(history).to_csv('outputs/fwd_history.csv', index=False)
-    torch.save(model.state_dict(), 'outputs/fwd_model.pth')
-    print("Forward PINO training complete. Model saved to outputs/fwd_model.pth")
+    torch.save(model.state_dict(), 'outputs/fwd_model_final.pth')
+    print(f"Done. Best val rel-L2: {best_val_loss:.6f}")
+    print("outputs/fwd_model_best.pth  |  outputs/fwd_model_final.pth")
 
 
 if __name__ == '__main__':
