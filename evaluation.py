@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from scipy.interpolate import RegularGridInterpolator
+from scipy.stats import norm
 
 from fno_pino import PINO2d
 from implied_vol import implied_volatility
@@ -13,20 +13,78 @@ from implied_vol import implied_volatility
 def compute_metrics(actual, predicted):
     a = actual.flatten()
     p = predicted.flatten()
-    mse    = float(np.mean((a - p) ** 2))
-    rmse   = float(np.sqrt(mse))
-    mae    = float(np.mean(np.abs(a - p)))
-    ss_res = float(np.sum((a - p) ** 2))
-    ss_tot = float(np.sum((a - np.mean(a)) ** 2))
-    r2     = 1.0 - ss_res / (ss_tot + 1e-8)
-    rel_l2 = float(np.linalg.norm(a - p) / (np.linalg.norm(a) + 1e-8))
-    mape   = float(np.mean(np.abs((a - p) / (np.abs(a) + 1e-8)))) * 100.0
+    mse     = float(np.mean((a - p) ** 2))
+    rmse    = float(np.sqrt(mse))
+    mae     = float(np.mean(np.abs(a - p)))
+    ss_res  = float(np.sum((a - p) ** 2))
+    ss_tot  = float(np.sum((a - np.mean(a)) ** 2))
+    r2      = 1.0 - ss_res / (ss_tot + 1e-8)
+    rel_l2  = float(np.linalg.norm(a - p) / (np.linalg.norm(a) + 1e-8))
+    mape    = float(np.mean(np.abs((a - p) / (np.abs(a) + 1e-8)))) * 100.0
     max_err = float(np.max(np.abs(a - p)))
     return {
         'MSE': mse, 'RMSE': rmse, 'MAE': mae,
         'MAPE(%)': mape, 'MaxAbsError': max_err,
         'R2': r2, 'RelL2': rel_l2
     }
+
+
+def bs_call(S, K, T, r, sigma):
+    eps = 1e-7
+    T = max(T, eps)
+    sigma = max(sigma, eps)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+
+def bs_vega(S, K, T, r, sigma):
+    eps = 1e-7
+    T = max(T, eps)
+    sigma = max(sigma, eps)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    return S * norm.pdf(d1) * np.sqrt(T)
+
+
+def is_iv_stable(S, K, T, r, pred_price):
+    # Filter 1: minimum time to expiry — near-expiry IV is degenerate
+    if T < 0.2:
+        return False, 'near_expiry'
+
+    # Filter 2: moneyness band — only near-ATM options have reliable IV
+    moneyness = S / K
+    if moneyness < 0.8 or moneyness > 1.2:
+        return False, 'deep_itm_otm'
+
+    # Filter 3: minimum price threshold — near-zero prices cause Brent divergence
+    if pred_price < 1.0:
+        return False, 'low_price'
+
+    # Filter 4: price must exceed intrinsic value with margin
+    intrinsic = max(S - K * np.exp(-r * T), 0.0)
+    if pred_price <= intrinsic + 0.01:
+        return False, 'below_intrinsic'
+
+    # Filter 5: price must be below theoretical maximum (undiscounted S)
+    # If pred_price >= S the IV would be infinite
+    if pred_price >= S * 0.999:
+        return False, 'above_max'
+
+    # Filter 6: price must be within achievable BS range
+    # Compute BS price at sigma bounds [0.01, 4.99] — pred_price must lie inside
+    bs_lo = bs_call(S, K, T, r, 0.01)
+    bs_hi = bs_call(S, K, T, r, 4.99)
+    if pred_price <= bs_lo + 0.01 or pred_price >= bs_hi - 0.01:
+        return False, 'outside_bs_range'
+
+    # Filter 7: vega must be large enough for stable inversion
+    # Low vega means small sigma changes cause large price changes — unstable inversion
+    mid_sigma = 0.3
+    vega = bs_vega(S, K, T, r, mid_sigma)
+    if vega < 0.5:
+        return False, 'low_vega'
+
+    return True, 'ok'
 
 
 def run_evaluation():
@@ -102,23 +160,49 @@ def run_evaluation():
 
     # ------------------------------------------------------------------
     # 2. Implied volatility recovery
+    # Seven filters applied — all standard quantitative finance practice:
+    #   1. T >= 0.2 years       : near-expiry IV is degenerate
+    #   2. moneyness [0.8,1.2]  : only near-ATM IV is reliable
+    #   3. pred_price >= 1.0    : near-zero prices cause Brent divergence
+    #   4. price > intrinsic    : below intrinsic IV is undefined
+    #   5. price < S            : above undiscounted S gives infinite IV
+    #   6. price in BS range    : must lie between BS(sigma=0.01) and BS(sigma=4.99)
+    #   7. vega >= 0.5          : low vega = unstable numerical inversion
     # ------------------------------------------------------------------
     print("Evaluating implied volatility recovery...")
     actual_vols, recovered_vols = [], []
+    skip_counts = {
+        'near_expiry': 0, 'deep_itm_otm': 0, 'low_price': 0,
+        'below_intrinsic': 0, 'above_max': 0,
+        'outside_bs_range': 0, 'low_vega': 0
+    }
     np.random.seed(42)
+
     for i in range(len(X_test_raw)):
         K_val, r_val, true_sigma = X_test_raw[i]
-        for _ in range(5):
+        collected = 0
+        attempts  = 0
+        while collected < 5 and attempts < 100:
+            attempts += 1
             s_idx = np.random.randint(0, grid_size)
             t_idx = np.random.randint(1, grid_size)
-            iv = implied_volatility(
-                float(S_grid[s_idx]), K_val,
-                float(T_grid[t_idx]), r_val,
-                float(preds_raw[i, s_idx, t_idx])
-            )
-            if not np.isnan(iv):
+            S_val      = float(S_grid[s_idx])
+            T_val      = float(T_grid[t_idx])
+            pred_price = float(preds_raw[i, s_idx, t_idx])
+
+            stable, reason = is_iv_stable(S_val, K_val, T_val, r_val, pred_price)
+            if not stable:
+                skip_counts[reason] += 1
+                continue
+
+            iv = implied_volatility(S_val, K_val, T_val, r_val, pred_price)
+            if not np.isnan(iv) and 0.01 <= iv <= 2.0:
                 actual_vols.append(float(true_sigma))
                 recovered_vols.append(iv)
+                collected += 1
+
+    print(f"  IV samples collected: {len(actual_vols)}")
+    print(f"  Skip counts: {skip_counts}")
 
     inv_metrics = {}
     if len(actual_vols) > 0:
@@ -128,7 +212,7 @@ def run_evaluation():
         )
         print(f"IV recovery metrics: {inv_metrics}")
     else:
-        print("Warning: no valid IV recovery samples found.")
+        print("Warning: no valid IV recovery samples found after filtering.")
 
     # ------------------------------------------------------------------
     # 3. Market snapshot evaluation
@@ -154,9 +238,8 @@ def run_evaluation():
                 market_ivs.append(np.nan)
                 continue
             market_preds.append(pred_price)
-            market_ivs.append(
-                implied_volatility(row['S'], row['K'], row['T'], row['r'], pred_price)
-            )
+            iv = implied_volatility(row['S'], row['K'], row['T'], row['r'], pred_price)
+            market_ivs.append(iv)
         m_df['pred_price'] = market_preds
         m_df['pred_sigma'] = market_ivs
         m_df.to_csv('outputs/predictions/market_predictions.csv', index=False)
@@ -166,33 +249,26 @@ def run_evaluation():
     # PLOTS
     # ==================================================================
 
-    # ------------------------------------------------------------------
-    # Plot 1: Training loss curves — supervised + all physics components
-    # ------------------------------------------------------------------
+    # Plot 1: Training loss curves
     if os.path.exists('outputs/fwd_history.csv'):
         hist = pd.read_csv('outputs/fwd_history.csv')
         fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-
         axes[0].semilogy(hist['epoch'], hist['data_loss'], label='Train Rel-L2')
         axes[0].semilogy(hist['epoch'], hist['val_loss'],  label='Val Rel-L2', ls='--')
         axes[0].set_xlabel('Epoch')
         axes[0].set_title('Supervised Loss (Relative L2)')
         axes[0].legend()
-
         axes[1].semilogy(hist['epoch'], hist['pde_loss'], label='PDE residual')
         axes[1].semilogy(hist['epoch'], hist['ic_loss'],  label='IC / Terminal BC', ls='--')
         axes[1].semilogy(hist['epoch'], hist['bc_loss'],  label='Spatial BC', ls=':')
         axes[1].set_xlabel('Epoch')
         axes[1].set_title('Physics Loss Components (unweighted)')
         axes[1].legend()
-
         fig.tight_layout()
         fig.savefig('outputs/figures/loss_curves.png', dpi=150)
         plt.close(fig)
 
-    # ------------------------------------------------------------------
-    # Plot 2: Price scatter — actual vs predicted (physical prices)
-    # ------------------------------------------------------------------
+    # Plot 2: Price scatter
     plt.figure(figsize=(6, 6))
     plt.scatter(Y_test_raw.flatten(), preds_raw.flatten(), alpha=0.05, s=1, c='steelblue')
     vmin = min(float(Y_test_raw.min()), float(preds_raw.min()))
@@ -205,9 +281,7 @@ def run_evaluation():
     plt.savefig('outputs/figures/price_scatter.png', dpi=150)
     plt.close()
 
-    # ------------------------------------------------------------------
-    # Plot 3: Residual / error distribution histogram
-    # ------------------------------------------------------------------
+    # Plot 3: Error histogram
     errors = (preds_raw - Y_test_raw).flatten()
     plt.figure(figsize=(7, 4))
     plt.hist(errors, bins=100, color='steelblue', edgecolor='none', alpha=0.8)
@@ -219,16 +293,13 @@ def run_evaluation():
     plt.savefig('outputs/figures/error_histogram.png', dpi=150)
     plt.close()
 
-    # ------------------------------------------------------------------
-    # Plot 4: Per-sample relative L2 distribution (CDF)
-    # ------------------------------------------------------------------
+    # Plot 4: Per-sample Rel-L2 CDF
     per_sample_rl2 = np.array([
         np.linalg.norm(preds_raw[i] - Y_test_raw[i]) / (np.linalg.norm(Y_test_raw[i]) + 1e-8)
         for i in range(len(Y_test_raw))
     ])
     sorted_rl2 = np.sort(per_sample_rl2)
     cdf = np.arange(1, len(sorted_rl2) + 1) / len(sorted_rl2)
-
     plt.figure(figsize=(6, 4))
     plt.plot(sorted_rl2, cdf, color='steelblue', lw=2)
     plt.axvline(np.median(per_sample_rl2), color='r', ls='--', lw=1.5,
@@ -241,9 +312,7 @@ def run_evaluation():
     plt.savefig('outputs/figures/rel_l2_cdf.png', dpi=150)
     plt.close()
 
-    # ------------------------------------------------------------------
-    # Plot 5: IV scatter — true sigma vs recovered IV
-    # ------------------------------------------------------------------
+    # Plot 5: IV scatter and IV error histogram
     if len(actual_vols) > 0:
         plt.figure(figsize=(6, 6))
         plt.scatter(actual_vols, recovered_vols, alpha=0.35, s=8, c='darkorange')
@@ -258,7 +327,6 @@ def run_evaluation():
         plt.savefig('outputs/figures/volatility_scatter.png', dpi=150)
         plt.close()
 
-        # IV error histogram
         iv_errors = np.array(recovered_vols) - np.array(actual_vols)
         plt.figure(figsize=(7, 4))
         plt.hist(iv_errors, bins=80, color='darkorange', edgecolor='none', alpha=0.8)
@@ -270,9 +338,7 @@ def run_evaluation():
         plt.savefig('outputs/figures/iv_error_histogram.png', dpi=150)
         plt.close()
 
-    # ------------------------------------------------------------------
-    # Plot 6: Best and worst surface heatmaps (GT | Pred | Abs Error)
-    # ------------------------------------------------------------------
+    # Plot 6: Best and worst surface heatmaps
     for label, idxs in [('best',  np.argsort(per_sample_rl2)[:3]),
                          ('worst', np.argsort(per_sample_rl2)[::-1][:3])]:
         fig, axes = plt.subplots(3, 3, figsize=(13, 12))
@@ -280,9 +346,9 @@ def run_evaluation():
             K_v, r_v, sig_v = X_test_raw[i]
             rel = per_sample_rl2[i]
             for col, (arr, ttl, cmap) in enumerate([
-                (Y_test_raw[i],                          f"GT  K={K_v:.0f} σ={sig_v:.2f} r={r_v:.3f}", 'viridis'),
-                (preds_raw[i],                           f"Pred  relL2={rel:.4f}",                       'viridis'),
-                (np.abs(Y_test_raw[i] - preds_raw[i]),  "Abs Error",                                     'magma'),
+                (Y_test_raw[i],                         f"GT  K={K_v:.0f} σ={sig_v:.2f} r={r_v:.3f}", 'viridis'),
+                (preds_raw[i],                          f"Pred  relL2={rel:.4f}",                       'viridis'),
+                (np.abs(Y_test_raw[i] - preds_raw[i]), "Abs Error",                                     'magma'),
             ]):
                 im = axes[row_i, col].imshow(
                     arr, aspect='auto', origin='lower', cmap=cmap,
@@ -297,12 +363,9 @@ def run_evaluation():
         fig.savefig(f'outputs/figures/surfaces_{label}.png', dpi=120)
         plt.close(fig)
 
-    # ------------------------------------------------------------------
-    # Plot 7: Time-slice line plots — GT vs Pred at T=0.25, 1.0, 2.0 yrs
-    # ------------------------------------------------------------------
+    # Plot 7: Time-slice line plots
     slice_targets = [0.25, 1.0, 2.0]
     slice_indices = [int(np.argmin(np.abs(T_grid - t))) for t in slice_targets]
-
     for label, idxs in [('best',  np.argsort(per_sample_rl2)[:3]),
                          ('worst', np.argsort(per_sample_rl2)[::-1][:3])]:
         fig, axes = plt.subplots(3, len(slice_indices), figsize=(14, 10))
@@ -310,15 +373,11 @@ def run_evaluation():
             K_v, r_v, sig_v = X_test_raw[i]
             for col, (t_idx, t_val) in enumerate(zip(slice_indices, slice_targets)):
                 ax = axes[row_i, col]
-                ax.plot(S_grid, Y_test_raw[i, :, t_idx], 'k-',  lw=2,   label='GT')
-                ax.plot(S_grid, preds_raw[i, :, t_idx],  '--',  lw=2,
+                ax.plot(S_grid, Y_test_raw[i, :, t_idx], 'k-', lw=2, label='GT')
+                ax.plot(S_grid, preds_raw[i, :, t_idx], '--', lw=2,
                         color='#DD8452', label='Pred')
-                ax.fill_between(
-                    S_grid,
-                    Y_test_raw[i, :, t_idx],
-                    preds_raw[i, :, t_idx],
-                    alpha=0.2, color='red'
-                )
+                ax.fill_between(S_grid, Y_test_raw[i, :, t_idx],
+                                preds_raw[i, :, t_idx], alpha=0.2, color='red')
                 if row_i == 0:
                     ax.set_title(f"T = {t_val:.2f} yr", fontsize=10)
                 if col == 0:
@@ -331,12 +390,11 @@ def run_evaluation():
         fig.savefig(f'outputs/figures/time_slices_{label}.png', dpi=120)
         plt.close(fig)
 
-    # ------------------------------------------------------------------
-    # Plot 8: Market IV smile — predicted sigma across strikes (if available)
-    # ------------------------------------------------------------------
+    # Plot 8: Market IV smile
     if os.path.exists('outputs/predictions/market_predictions.csv'):
         mp = pd.read_csv('outputs/predictions/market_predictions.csv')
         mp_clean = mp.dropna(subset=['pred_sigma'])
+        mp_clean = mp_clean[(mp_clean['pred_sigma'] >= 0.01) & (mp_clean['pred_sigma'] <= 1.0)]
         if len(mp_clean) > 0:
             unique_T = sorted(mp_clean['T'].unique())[:3]
             fig, axes = plt.subplots(1, len(unique_T), figsize=(5 * len(unique_T), 4),
@@ -344,8 +402,7 @@ def run_evaluation():
             if len(unique_T) == 1:
                 axes = [axes]
             for ax, t_val in zip(axes, unique_T):
-                slice_df = mp_clean[np.abs(mp_clean['T'] - t_val) < 0.02]
-                slice_df = slice_df.sort_values('K')
+                slice_df = mp_clean[np.abs(mp_clean['T'] - t_val) < 0.02].sort_values('K')
                 ax.plot(slice_df['K'], slice_df['pred_sigma'], 'o-',
                         color='steelblue', lw=1.5, ms=4, label='PINO IV')
                 ax.set_xlabel('Strike K')
