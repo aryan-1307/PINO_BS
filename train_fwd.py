@@ -45,13 +45,12 @@ def train():
     Y_train_n,   Y_val_n   = Y_tensor[:split],     Y_tensor[split:]
     X_train_raw, X_val_raw = X_raw_tensor[:split], X_raw_tensor[split:]
 
-    # Updated: width=128 for more capacity, num_layers=4 unchanged
     model = PINO2d(modes1=16, modes2=16, width=128, num_layers=4).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    batch_size  = 64     # increased from 32
+    batch_size  = 64
     epochs      = 500
     grad_clip   = 1.0
     lambda_pde  = 1.0
@@ -65,12 +64,15 @@ def train():
     best_val_loss = float('inf')
     history = []
 
-    print("Starting PINO Training (normalised inputs/outputs)...")
+    print("Starting PINO Training — Phase 1: Adam...")
     print(f"  Train: {len(X_train_n)} | Val: {len(X_val_n)}")
     print(f"  V_scale={V_scale:.1f} | param ranges: {param_min} -> {param_max}")
     print(f"  PDE warmup={pde_warmup} | ramp={pde_ramp}")
     print(f"  width=128 | batch_size=64 | two Fourier weights | MLP layers")
 
+    # ------------------------------------------------------------------
+    # Phase 1: Adam optimiser — 500 epochs
+    # ------------------------------------------------------------------
     for epoch in range(1, epochs + 1):
         if epoch <= pde_warmup:
             curr_lambda_pde = 0.0
@@ -98,8 +100,7 @@ def train():
             optimizer.zero_grad()
 
             V_pred_n = model(bp_n, S_grid_2d_n, T_grid_2d_n)
-
-            l_data = relative_l2_loss(V_pred_n, by_n)
+            l_data   = relative_l2_loss(V_pred_n, by_n)
 
             l_phys, l_pde, l_ic, l_bc = compute_pino_loss(
                 V_pred_n, bp_raw, S_grid_1d, T_grid_1d, V_scale_t,
@@ -134,10 +135,7 @@ def train():
             for v in range(int(np.ceil(num_val / batch_size))):
                 vs = v * batch_size
                 ve = min(vs + batch_size, num_val)
-                vp = model(
-                    X_val_n[vs:ve].to(device),
-                    S_grid_2d_n, T_grid_2d_n
-                )
+                vp = model(X_val_n[vs:ve].to(device), S_grid_2d_n, T_grid_2d_n)
                 val_accum += relative_l2_loss(vp, Y_val_n[vs:ve].to(device)).item() * (ve - vs)
 
         val_loss = val_accum / num_val
@@ -158,12 +156,93 @@ def train():
         history.append({
             'epoch': epoch, 'train_loss': ep_total, 'data_loss': ep_data,
             'pde_loss': ep_pde, 'ic_loss': ep_ic, 'bc_loss': ep_bc,
-            'val_loss': val_loss, 'lambda_pde': curr_lambda_pde
+            'val_loss': val_loss, 'lambda_pde': curr_lambda_pde,
+            'phase': 'adam'
+        })
+
+    pd.DataFrame(history).to_csv('outputs/fwd_history.csv', index=False)
+    torch.save(model.state_dict(), 'outputs/fwd_model_adam.pth')
+    print(f"Adam phase done. Best val rel-L2: {best_val_loss:.6f}")
+
+    # ------------------------------------------------------------------
+    # Phase 2: L-BFGS fine-tuning on full training set
+    # Loads best Adam checkpoint and refines further with a second-order
+    # optimiser. Uses the full training batch in each L-BFGS step
+    # (standard practice — L-BFGS requires consistent loss evaluations).
+    # ------------------------------------------------------------------
+    print("\nStarting Phase 2: L-BFGS fine-tuning...")
+
+    # Reload best Adam weights as starting point for L-BFGS
+    model.load_state_dict(torch.load('outputs/fwd_model_best.pth', map_location=device))
+    model.train()
+
+    # Move full training data to device once for L-BFGS closure
+    # Use a random subset of 512 samples to keep L-BFGS steps tractable on CPU
+    lbfgs_n     = min(512, len(X_train_n))
+    lbfgs_idx   = torch.randperm(len(X_train_n))[:lbfgs_n]
+    lbfgs_xn    = X_train_n[lbfgs_idx].to(device)
+    lbfgs_xraw  = X_train_raw[lbfgs_idx].to(device)
+    lbfgs_yn    = Y_train_n[lbfgs_idx].to(device)
+
+    lbfgs_optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=0.1,
+        max_iter=20,
+        max_eval=25,
+        tolerance_grad=1e-7,
+        tolerance_change=1e-9,
+        history_size=100,
+        line_search_fn='strong_wolfe'
+    )
+
+    lbfgs_epochs    = 50
+    best_lbfgs_loss = float('inf')
+
+    for lbfgs_ep in range(1, lbfgs_epochs + 1):
+
+        def closure():
+            lbfgs_optimizer.zero_grad()
+            V_pred = model(lbfgs_xn, S_grid_2d_n, T_grid_2d_n)
+            l_d    = relative_l2_loss(V_pred, lbfgs_yn)
+            l_p, _, _, _ = compute_pino_loss(
+                V_pred, lbfgs_xraw, S_grid_1d, T_grid_1d, V_scale_t,
+                lambda_pde=lambda_pde, lambda_ic=lambda_ic, lambda_bc=lambda_bc
+            )
+            total = l_d + l_p
+            total.backward()
+            return total
+
+        loss_val = lbfgs_optimizer.step(closure)
+
+        # Validation after each L-BFGS epoch
+        model.eval()
+        val_accum = 0.0
+        with torch.no_grad():
+            for v in range(int(np.ceil(num_val / batch_size))):
+                vs = v * batch_size
+                ve = min(vs + batch_size, num_val)
+                vp = model(X_val_n[vs:ve].to(device), S_grid_2d_n, T_grid_2d_n)
+                val_accum += relative_l2_loss(vp, Y_val_n[vs:ve].to(device)).item() * (ve - vs)
+        val_loss = val_accum / num_val
+        model.train()
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'outputs/fwd_model_best.pth')
+
+        print(f"L-BFGS {lbfgs_ep:02d}/{lbfgs_epochs} | loss={loss_val:.6f} | val={val_loss:.4f} | best={best_val_loss:.4f}")
+
+        history.append({
+            'epoch': epochs + lbfgs_ep, 'train_loss': float(loss_val),
+            'data_loss': float(loss_val), 'pde_loss': 0.0,
+            'ic_loss': 0.0, 'bc_loss': 0.0,
+            'val_loss': val_loss, 'lambda_pde': lambda_pde,
+            'phase': 'lbfgs'
         })
 
     pd.DataFrame(history).to_csv('outputs/fwd_history.csv', index=False)
     torch.save(model.state_dict(), 'outputs/fwd_model_final.pth')
-    print(f"Done. Best val rel-L2: {best_val_loss:.6f}")
+    print(f"\nAll training done. Best val rel-L2: {best_val_loss:.6f}")
     print("outputs/fwd_model_best.pth  |  outputs/fwd_model_final.pth")
 
 
