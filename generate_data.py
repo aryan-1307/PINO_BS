@@ -12,11 +12,10 @@ def black_scholes_call(S, K, T, r, sigma):
     return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
 
-def make_dataset(num_surfaces=5000, grid_size=64):
+def make_dataset(num_surfaces=10000, grid_size=64):
     np.random.seed(42)
     os.makedirs('data/generated', exist_ok=True)
 
-    # Raw parameter ranges — kept as constants so normalisation stats are exact
     K_min,     K_max     = 50.0,  1000.0
     r_min,     r_max     = 0.0,   0.10
     sigma_min, sigma_max = 0.05,  1.0
@@ -40,23 +39,12 @@ def make_dataset(num_surfaces=5000, grid_size=64):
         if (i + 1) % 1000 == 0:
             print(f"  {i+1}/{num_surfaces} surfaces generated...")
 
-    inputs   = np.array(inputs,   dtype=np.float32)   # (N, 3)
-    surfaces = np.array(surfaces, dtype=np.float32)   # (N, 64, 64)
+    inputs   = np.array(inputs,   dtype=np.float32)
+    surfaces = np.array(surfaces, dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Normalisation stats — computed here once, stored in the npz.
-    # Every downstream file loads these instead of redefining them.
-    #
-    # Inputs [K, r, sigma]: min-max to [0, 1] using known range bounds.
-    # Output V: divide by S_max so V_norm in [0, 1].
-    #   V_norm satisfies the same linear BS PDE — no PDE form changes needed.
-    # Grids S, T: normalised to [0, 1] for model input channels only.
-    #   The raw grids are kept separately for FD stencils and BC targets
-    #   because the PDE coefficients (sigma^2 * S^2 etc.) use physical S values.
-    # ------------------------------------------------------------------
     param_min = np.array([K_min,  r_min,  sigma_min], dtype=np.float32)
     param_max = np.array([K_max,  r_max,  sigma_max], dtype=np.float32)
-    V_scale   = np.float32(S_max)   # single scalar divisor for output
+    V_scale   = np.float32(S_max)
 
     np.savez_compressed(
         'data/generated/dataset.npz',
@@ -71,7 +59,7 @@ def make_dataset(num_surfaces=5000, grid_size=64):
     print(f"Saved {num_surfaces} surfaces -> data/generated/dataset.npz")
     print(f"  param_min = {param_min}")
     print(f"  param_max = {param_max}")
-    print(f"  V_scale   = {V_scale}  (output divided by this)")
+    print(f"  V_scale   = {V_scale}")
 
 
 if __name__ == '__main__':

@@ -4,7 +4,25 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Spectral Convolution layer
+# MLP block used inside each FNO layer — more expressive than single Conv2d
+# ---------------------------------------------------------------------------
+
+class MLP(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels):
+        super().__init__()
+        self.mlp1 = nn.Conv2d(in_channels, mid_channels, 1)
+        self.mlp2 = nn.Conv2d(mid_channels, out_channels, 1)
+
+    def forward(self, x):
+        x = self.mlp1(x)
+        x = F.gelu(x)
+        x = self.mlp2(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Spectral Convolution — two sets of Fourier weights covering both
+# low-frequency [:modes] and high-frequency [-modes:] spectral components
 # ---------------------------------------------------------------------------
 
 class SpectralConv2d(nn.Module):
@@ -15,7 +33,10 @@ class SpectralConv2d(nn.Module):
         self.modes1 = modes1
         self.modes2 = modes2
         scale = 1.0 / (in_channels * out_channels)
-        self.weights = nn.Parameter(
+        self.weights1 = nn.Parameter(
+            scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
+        )
+        self.weights2 = nn.Parameter(
             scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
         )
 
@@ -26,41 +47,41 @@ class SpectralConv2d(nn.Module):
             B, self.out_channels, x.size(-2), x_ft.size(-1),
             dtype=torch.cfloat, device=x.device
         )
+        # Low-frequency modes
         out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
             "bixy,ioxy->boxy",
             x_ft[:, :, :self.modes1, :self.modes2],
-            self.weights
+            self.weights1
+        )
+        # High-frequency modes
+        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+            "bixy,ioxy->boxy",
+            x_ft[:, :, -self.modes1:, :self.modes2],
+            self.weights2
         )
         return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
 
 
 # ---------------------------------------------------------------------------
 # PINO2d — receives normalised inputs, produces normalised output
-#
-# Input channels fed to the network:
-#   [K_n, r_n, sigma_n, S_n, T_n]   all in [0, 1]
-#
-# Output: V_norm = V / V_scale, also approximately in [0, 1]
+# Uses MLP inside each FNO layer for more expressive power
 # ---------------------------------------------------------------------------
 
 class PINO2d(nn.Module):
-    def __init__(self, modes1=16, modes2=16, width=64, num_layers=4):
+    def __init__(self, modes1=16, modes2=16, width=128, num_layers=4):
         super().__init__()
         self.width = width
         self.fc0   = nn.Linear(5, width)
         self.convs = nn.ModuleList(
             [SpectralConv2d(width, width, modes1, modes2) for _ in range(num_layers)]
         )
-        self.ws    = nn.ModuleList(
-            [nn.Conv2d(width, width, 1) for _ in range(num_layers)]
+        self.mlps  = nn.ModuleList(
+            [MLP(width, width, width) for _ in range(num_layers)]
         )
         self.fc1   = nn.Linear(width, 128)
         self.fc2   = nn.Linear(128, 1)
 
     def forward(self, params_n, S_grid_n, T_grid_n):
-        # params_n:  (B, 3)  normalised [K_n, r_n, sigma_n]
-        # S_grid_n:  (Nx, Nt) or (B, Nx, Nt)  normalised S in [0, 1]
-        # T_grid_n:  same shape, normalised T in [0, 1]
         B = params_n.shape[0]
         K_n     = params_n[:, 0].view(B, 1, 1)
         r_n     = params_n[:, 1].view(B, 1, 1)
@@ -73,22 +94,19 @@ class PINO2d(nn.Module):
         r_e     = r_n.expand_as(K_e)
         sigma_e = sigma_n.expand_as(K_e)
 
-        x = torch.stack([K_e, r_e, sigma_e, S_n, T_n], dim=-1)   # (B, Nx, Nt, 5)
-        x = self.fc0(x)                                            # (B, Nx, Nt, W)
-        x = x.permute(0, 3, 1, 2)                                 # (B, W, Nx, Nt)
-        for conv, w in zip(self.convs, self.ws):
-            x = F.gelu(conv(x) + w(x))
-        x = x.permute(0, 2, 3, 1)                                 # (B, Nx, Nt, W)
+        x = torch.stack([K_e, r_e, sigma_e, S_n, T_n], dim=-1)
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1, 2)
+        for conv, mlp in zip(self.convs, self.mlps):
+            x = F.gelu(conv(x) + mlp(x))
+        x = x.permute(0, 2, 3, 1)
         x = F.gelu(self.fc1(x))
         x = self.fc2(x)
-        return x.squeeze(-1)                                       # (B, Nx, Nt)
+        return x.squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
-# 4th-order FD stencils
-# Operate on V_norm but use PHYSICAL S/T grids for derivative scaling.
-# This is correct: d(V_norm)/dS = (1/V_scale) * dV/dS.
-# The BS PDE in normalised form is identical — linearity means V_scale cancels.
+# 4th-order FD stencils — faster and more stable than autograd double-backward
 # ---------------------------------------------------------------------------
 
 def _fd4_d2_dx(u, dx):
@@ -98,7 +116,7 @@ def _fd4_d2_dx(u, dx):
         [-1/12, 4/3, -5/2, 4/3, -1/12], dtype=u.dtype, device=u.device
     ).view(1, 1, 5) / (dx ** 2)
     out = F.conv1d(u_p, kernel).squeeze(1)
-    return out.view(B, Nt, Nx - 4).permute(0, 2, 1)   # (B, Nx-4, Nt)
+    return out.view(B, Nt, Nx - 4).permute(0, 2, 1)
 
 
 def _fd4_d1_dx(u, dx):
@@ -122,34 +140,28 @@ def _fd2_d1_dt(u, dt):
 
 
 def _pde_residual(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw):
-    # V_norm:          (B, Nx, Nt)  — normalised output from model
-    # params_raw:      (B, 3)       — UN-normalised [K, r, sigma] for PDE coefficients
-    # S_grid_1d_raw:   (Nx,)        — physical S values for d/dS scaling
-    # T_grid_1d_raw:   (Nt,)        — physical T values for d/dT scaling
     dx = (S_grid_1d_raw[1] - S_grid_1d_raw[0]).item()
     dt = (T_grid_1d_raw[1] - T_grid_1d_raw[0]).item()
 
-    V_SS = _fd4_d2_dx(V_norm, dx)   # (B, Nx-4, Nt)
-    V_S  = _fd4_d1_dx(V_norm, dx)   # (B, Nx-4, Nt)
-    V_T  = _fd2_d1_dt(V_norm, dt)   # (B, Nx, Nt-2)
+    V_SS = _fd4_d2_dx(V_norm, dx)
+    V_S  = _fd4_d1_dx(V_norm, dx)
+    V_T  = _fd2_d1_dt(V_norm, dt)
 
-    # Valid interior: trim to common region
-    V_SS_v = V_SS[:, :, 1:-1]    # (B, Nx-4, Nt-2)
+    V_SS_v = V_SS[:, :, 1:-1]
     V_S_v  = V_S[:, :,  1:-1]
-    V_T_v  = V_T[:, 2:-2, :]     # (B, Nx-4, Nt-2)
+    V_T_v  = V_T[:, 2:-2, :]
     V_v    = V_norm[:, 2:-2, 1:-1]
 
     sigma = params_raw[:, 2].view(-1, 1, 1)
     r     = params_raw[:, 1].view(-1, 1, 1)
-    S_v   = S_grid_1d_raw[2:-2].view(1, -1, 1)   # physical S, (1, Nx-4, 1)
+    S_v   = S_grid_1d_raw[2:-2].view(1, -1, 1)
 
-    # BS PDE (V_norm satisfies same equation as V because the PDE is linear)
     residual = V_T_v - 0.5 * sigma**2 * S_v**2 * V_SS_v - r * S_v * V_S_v + r * V_v
     return torch.mean(residual ** 2)
 
 
 # ---------------------------------------------------------------------------
-# Full physics loss — all terms operate on normalised V so magnitudes ~O(1)
+# Full physics loss with separate trackable components
 # ---------------------------------------------------------------------------
 
 def compute_pino_loss(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw, V_scale,
@@ -158,17 +170,14 @@ def compute_pino_loss(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw, V_scale,
 
     l_pde = _pde_residual(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw)
 
-    # IC: V_norm(S, T=0) = max(S - K, 0) / V_scale
     V_ic  = V_norm[:, :, 0]
     S_ic  = S_grid_1d_raw.unsqueeze(0).expand(B, -1)
     K_ic  = params_raw[:, 0].view(B, 1).expand_as(V_ic)
     payoff_norm = torch.clamp(S_ic - K_ic, min=0.0) / V_scale
     l_ic  = F.mse_loss(V_ic, payoff_norm)
 
-    # BC lower: V_norm(S=0, T) = 0
     l_bc_low = torch.mean(V_norm[:, 0, :] ** 2)
 
-    # BC upper: V_norm(S_max, T) = (S_max - K*exp(-r*T)) / V_scale
     V_high  = V_norm[:, -1, :]
     S_max   = S_grid_1d_raw[-1].item()
     T_bc    = T_grid_1d_raw.unsqueeze(0).expand(B, -1)
@@ -183,7 +192,7 @@ def compute_pino_loss(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw, V_scale,
 
 
 # ---------------------------------------------------------------------------
-# Supervised loss: relative L2 on normalised outputs (both in [0,1])
+# Relative L2 loss — scale-invariant, standard in operator learning
 # ---------------------------------------------------------------------------
 
 def relative_l2_loss(pred, target):

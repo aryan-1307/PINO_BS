@@ -14,41 +14,30 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
 
-    data = np.load(dataset_path)
-    X_raw    = data['inputs']      # (N, 3)   [K, r, sigma]  — raw
-    Y_raw    = data['surfaces']    # (N, 64, 64)              — raw prices
-    S_grid   = data['S_grid']      # (64,)  physical values
-    T_grid   = data['T_grid']      # (64,)  physical values
-    param_min = data['param_min']  # (3,)
-    param_max = data['param_max']  # (3,)
+    data      = np.load(dataset_path)
+    X_raw     = data['inputs']
+    Y_raw     = data['surfaces']
+    S_grid    = data['S_grid']
+    T_grid    = data['T_grid']
+    param_min = data['param_min']
+    param_max = data['param_max']
     V_scale   = float(data['V_scale'][0])
 
-    # ------------------------------------------------------------------
-    # Normalise inputs and outputs
-    # ------------------------------------------------------------------
-    # Params → [0, 1]
     X_norm = (X_raw - param_min) / (param_max - param_min + 1e-8)
-
-    # Surfaces → [0, 1]  (divide by V_scale = S_max = 1000)
     Y_norm = Y_raw / V_scale
 
-    X_tensor = torch.tensor(X_norm, dtype=torch.float32)
-    Y_tensor = torch.tensor(Y_norm, dtype=torch.float32)
+    X_tensor     = torch.tensor(X_norm, dtype=torch.float32)
+    Y_tensor     = torch.tensor(Y_norm, dtype=torch.float32)
+    X_raw_tensor = torch.tensor(X_raw,  dtype=torch.float32)
 
-    # Raw params kept on CPU for physics loss (PDE coefficients need physical values)
-    X_raw_tensor = torch.tensor(X_raw, dtype=torch.float32)
-
-    # Physical 1D grids on device for FD stencils and BC targets
-    S_grid_1d = torch.tensor(S_grid, dtype=torch.float32).to(device)
-    T_grid_1d = torch.tensor(T_grid, dtype=torch.float32).to(device)
-
-    # Normalised 2D grids for model input channels
     S_norm = (S_grid - S_grid.min()) / (S_grid.max() - S_grid.min())
     T_norm = (T_grid - T_grid.min()) / (T_grid.max() - T_grid.min())
     S_mesh_n, T_mesh_n = np.meshgrid(S_norm, T_norm, indexing='ij')
     S_grid_2d_n = torch.tensor(S_mesh_n, dtype=torch.float32).to(device)
     T_grid_2d_n = torch.tensor(T_mesh_n, dtype=torch.float32).to(device)
 
+    S_grid_1d = torch.tensor(S_grid, dtype=torch.float32).to(device)
+    T_grid_1d = torch.tensor(T_grid, dtype=torch.float32).to(device)
     V_scale_t = torch.tensor(V_scale, dtype=torch.float32).to(device)
 
     split = int(0.8 * len(X_tensor))
@@ -56,11 +45,13 @@ def train():
     Y_train_n,   Y_val_n   = Y_tensor[:split],     Y_tensor[split:]
     X_train_raw, X_val_raw = X_raw_tensor[:split], X_raw_tensor[split:]
 
-    model = PINO2d(modes1=16, modes2=16, width=64, num_layers=4).to(device)
+    # Updated: width=128 for more capacity, num_layers=4 unchanged
+    model = PINO2d(modes1=16, modes2=16, width=128, num_layers=4).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    batch_size  = 32
+    batch_size  = 64     # increased from 32
     epochs      = 500
     grad_clip   = 1.0
     lambda_pde  = 1.0
@@ -78,6 +69,7 @@ def train():
     print(f"  Train: {len(X_train_n)} | Val: {len(X_val_n)}")
     print(f"  V_scale={V_scale:.1f} | param ranges: {param_min} -> {param_max}")
     print(f"  PDE warmup={pde_warmup} | ramp={pde_ramp}")
+    print(f"  width=128 | batch_size=64 | two Fourier weights | MLP layers")
 
     for epoch in range(1, epochs + 1):
         if epoch <= pde_warmup:
@@ -99,15 +91,13 @@ def train():
             i1  = min(i0 + batch_size, num_samples)
             idx = perm[i0:i1]
 
-            # Normalised params for model input
             bp_n   = X_train_n[idx].to(device)
-            # Raw params for physics (PDE coefficients)
             bp_raw = X_train_raw[idx].to(device)
             by_n   = Y_train_n[idx].to(device)
 
             optimizer.zero_grad()
 
-            V_pred_n = model(bp_n, S_grid_2d_n, T_grid_2d_n)   # (B, 64, 64), normalised
+            V_pred_n = model(bp_n, S_grid_2d_n, T_grid_2d_n)
 
             l_data = relative_l2_loss(V_pred_n, by_n)
 
@@ -136,7 +126,6 @@ def train():
         ep_ic    /= num_samples
         ep_bc    /= num_samples
 
-        # Validation
         model.eval()
         val_accum = 0.0
         num_val   = len(X_val_n)
