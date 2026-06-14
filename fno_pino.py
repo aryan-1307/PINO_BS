@@ -1,87 +1,39 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------------
-# MLP block used inside each FNO layer — more expressive than single Conv2d
-# ---------------------------------------------------------------------------
-
-class MLP(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels):
-        super().__init__()
-        self.mlp1 = nn.Conv2d(in_channels, mid_channels, 1)
-        self.mlp2 = nn.Conv2d(mid_channels, out_channels, 1)
-
-    def forward(self, x):
-        x = self.mlp1(x)
-        x = F.gelu(x)
-        x = self.mlp2(x)
-        return x
-
+from neuralop.models import FNO
 
 # ---------------------------------------------------------------------------
-# Spectral Convolution — two sets of Fourier weights covering both
-# low-frequency [:modes] and high-frequency [-modes:] spectral components
-# ---------------------------------------------------------------------------
-
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes1, modes2):
-        super().__init__()
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1
-        self.modes2 = modes2
-        scale = 1.0 / (in_channels * out_channels)
-        self.weights1 = nn.Parameter(
-            scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
-        )
-        self.weights2 = nn.Parameter(
-            scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
-        )
-
-    def forward(self, x):
-        B = x.shape[0]
-        x_ft = torch.fft.rfft2(x)
-        out_ft = torch.zeros(
-            B, self.out_channels, x.size(-2), x_ft.size(-1),
-            dtype=torch.cfloat, device=x.device
-        )
-        # Low-frequency modes
-        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
-            "bixy,ioxy->boxy",
-            x_ft[:, :, :self.modes1, :self.modes2],
-            self.weights1
-        )
-        # High-frequency modes
-        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
-            "bixy,ioxy->boxy",
-            x_ft[:, :, -self.modes1:, :self.modes2],
-            self.weights2
-        )
-        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
-
-
-# ---------------------------------------------------------------------------
-# PINO2d — receives normalised inputs, produces normalised output
-# Uses MLP inside each FNO layer for more expressive power
+# PINO2d — uses neuralop FNO backbone for:
+#   - Layer normalization between spectral blocks
+#   - Both low and high frequency Fourier weights
+#   - MLP projection layers inside each block
+#   - Well-tested spectral convolution implementation
+#
+# Input channels fed to FNO: [K_n, r_n, sigma_n, S_n, T_n] — all in [0,1]
+# Output: V_norm = V / V_scale, approximately in [0,1]
 # ---------------------------------------------------------------------------
 
 class PINO2d(nn.Module):
     def __init__(self, modes1=16, modes2=16, width=128, num_layers=4):
         super().__init__()
         self.width = width
-        self.fc0   = nn.Linear(5, width)
-        self.convs = nn.ModuleList(
-            [SpectralConv2d(width, width, modes1, modes2) for _ in range(num_layers)]
+
+        # neuralop FNO with 5 input channels (K, r, sigma, S, T)
+        # all normalised to [0,1]
+        self.fno = FNO(
+            n_modes=(modes1, modes2),
+            in_channels=5,
+            out_channels=1,
+            hidden_channels=width,
+            n_layers=num_layers,
+            positional_embedding=None,
         )
-        self.mlps  = nn.ModuleList(
-            [MLP(width, width, width) for _ in range(num_layers)]
-        )
-        self.fc1   = nn.Linear(width, 128)
-        self.fc2   = nn.Linear(128, 1)
 
     def forward(self, params_n, S_grid_n, T_grid_n):
+        # params_n:  (B, 3) normalised [K_n, r_n, sigma_n]
+        # S_grid_n:  (Nx, Nt) or (B, Nx, Nt) normalised S in [0,1]
+        # T_grid_n:  same shape, normalised T in [0,1]
         B = params_n.shape[0]
         K_n     = params_n[:, 0].view(B, 1, 1)
         r_n     = params_n[:, 1].view(B, 1, 1)
@@ -90,23 +42,20 @@ class PINO2d(nn.Module):
         S_n = S_grid_n.unsqueeze(0).expand(B, -1, -1) if S_grid_n.dim() == 2 else S_grid_n
         T_n = T_grid_n.unsqueeze(0).expand(B, -1, -1) if T_grid_n.dim() == 2 else T_grid_n
 
-        K_e     = K_n.expand(-1,     S_n.shape[1], S_n.shape[2])
+        K_e     = K_n.expand(-1, S_n.shape[1], S_n.shape[2])
         r_e     = r_n.expand_as(K_e)
         sigma_e = sigma_n.expand_as(K_e)
 
-        x = torch.stack([K_e, r_e, sigma_e, S_n, T_n], dim=-1)
-        x = self.fc0(x)
-        x = x.permute(0, 3, 1, 2)
-        for conv, mlp in zip(self.convs, self.mlps):
-            x = F.gelu(conv(x) + mlp(x))
-        x = x.permute(0, 2, 3, 1)
-        x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        return x.squeeze(-1)
+        # Stack into (B, Nx, Nt, 5) then permute to (B, 5, Nx, Nt) for FNO
+        x = torch.stack([K_e, r_e, sigma_e, S_n, T_n], dim=1)  # (B, 5, Nx, Nt)
+
+        # FNO forward: (B, 5, Nx, Nt) -> (B, 1, Nx, Nt)
+        out = self.fno(x)           # (B, 1, Nx, Nt)
+        return out.squeeze(1)       # (B, Nx, Nt)
 
 
 # ---------------------------------------------------------------------------
-# 4th-order FD stencils — faster and more stable than autograd double-backward
+# 4th-order FD stencils — unchanged, operate on normalised V
 # ---------------------------------------------------------------------------
 
 def _fd4_d2_dx(u, dx):
@@ -156,12 +105,13 @@ def _pde_residual(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw):
     r     = params_raw[:, 1].view(-1, 1, 1)
     S_v   = S_grid_1d_raw[2:-2].view(1, -1, 1)
 
+    # BS PDE: dV/dT - 0.5*sigma^2*S^2*d2V/dS2 - r*S*dV/dS + r*V = 0
     residual = V_T_v - 0.5 * sigma**2 * S_v**2 * V_SS_v - r * S_v * V_S_v + r * V_v
     return torch.mean(residual ** 2)
 
 
 # ---------------------------------------------------------------------------
-# Full physics loss with separate trackable components
+# Full physics loss — all terms on normalised scale, fully unchanged
 # ---------------------------------------------------------------------------
 
 def compute_pino_loss(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw, V_scale,
@@ -170,14 +120,17 @@ def compute_pino_loss(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw, V_scale,
 
     l_pde = _pde_residual(V_norm, params_raw, S_grid_1d_raw, T_grid_1d_raw)
 
+    # IC: V_norm(S, T=0) = max(S - K, 0) / V_scale
     V_ic  = V_norm[:, :, 0]
     S_ic  = S_grid_1d_raw.unsqueeze(0).expand(B, -1)
     K_ic  = params_raw[:, 0].view(B, 1).expand_as(V_ic)
     payoff_norm = torch.clamp(S_ic - K_ic, min=0.0) / V_scale
     l_ic  = F.mse_loss(V_ic, payoff_norm)
 
+    # BC lower: V_norm(S=0, T) = 0
     l_bc_low = torch.mean(V_norm[:, 0, :] ** 2)
 
+    # BC upper: V_norm(S_max, T) = (S_max - K*exp(-r*T)) / V_scale
     V_high  = V_norm[:, -1, :]
     S_max   = S_grid_1d_raw[-1].item()
     T_bc    = T_grid_1d_raw.unsqueeze(0).expand(B, -1)

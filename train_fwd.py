@@ -23,6 +23,7 @@ def train():
     param_max = data['param_max']
     V_scale   = float(data['V_scale'][0])
 
+    # Normalise inputs and outputs
     X_norm = (X_raw - param_min) / (param_max - param_min + 1e-8)
     Y_norm = Y_raw / V_scale
 
@@ -30,12 +31,14 @@ def train():
     Y_tensor     = torch.tensor(Y_norm, dtype=torch.float32)
     X_raw_tensor = torch.tensor(X_raw,  dtype=torch.float32)
 
+    # Normalised 2D grids for model input channels
     S_norm = (S_grid - S_grid.min()) / (S_grid.max() - S_grid.min())
     T_norm = (T_grid - T_grid.min()) / (T_grid.max() - T_grid.min())
     S_mesh_n, T_mesh_n = np.meshgrid(S_norm, T_norm, indexing='ij')
     S_grid_2d_n = torch.tensor(S_mesh_n, dtype=torch.float32).to(device)
     T_grid_2d_n = torch.tensor(T_mesh_n, dtype=torch.float32).to(device)
 
+    # Physical 1D grids for FD stencils and BC targets
     S_grid_1d = torch.tensor(S_grid, dtype=torch.float32).to(device)
     T_grid_1d = torch.tensor(T_grid, dtype=torch.float32).to(device)
     V_scale_t = torch.tensor(V_scale, dtype=torch.float32).to(device)
@@ -64,15 +67,10 @@ def train():
     best_val_loss = float('inf')
     history = []
 
-    print("Starting PINO Training — Phase 1: Adam...")
+    print("Phase 1: Adam optimiser (500 epochs)...")
     print(f"  Train: {len(X_train_n)} | Val: {len(X_val_n)}")
-    print(f"  V_scale={V_scale:.1f} | param ranges: {param_min} -> {param_max}")
-    print(f"  PDE warmup={pde_warmup} | ramp={pde_ramp}")
-    print(f"  width=128 | batch_size=64 | two Fourier weights | MLP layers")
+    print(f"  V_scale={V_scale:.1f} | PDE warmup={pde_warmup} | ramp={pde_ramp}")
 
-    # ------------------------------------------------------------------
-    # Phase 1: Adam optimiser — 500 epochs
-    # ------------------------------------------------------------------
     for epoch in range(1, epochs + 1):
         if epoch <= pde_warmup:
             curr_lambda_pde = 0.0
@@ -165,24 +163,21 @@ def train():
     print(f"Adam phase done. Best val rel-L2: {best_val_loss:.6f}")
 
     # ------------------------------------------------------------------
-    # Phase 2: L-BFGS fine-tuning on full training set
-    # Loads best Adam checkpoint and refines further with a second-order
-    # optimiser. Uses the full training batch in each L-BFGS step
-    # (standard practice — L-BFGS requires consistent loss evaluations).
+    # Phase 2: L-BFGS fine-tuning
+    # Loads best Adam checkpoint and refines with second-order optimiser.
+    # Requires sufficient GPU memory — runs on Colab T4 without issues.
     # ------------------------------------------------------------------
-    print("\nStarting Phase 2: L-BFGS fine-tuning...")
+    print("\nPhase 2: L-BFGS fine-tuning (50 epochs)...")
 
-    # Reload best Adam weights as starting point for L-BFGS
     model.load_state_dict(torch.load('outputs/fwd_model_best.pth', map_location=device))
     model.train()
 
-    # Move full training data to device once for L-BFGS closure
-    # Use a random subset of 512 samples to keep L-BFGS steps tractable on CPU
-    lbfgs_n     = min(512, len(X_train_n))
-    lbfgs_idx   = torch.randperm(len(X_train_n))[:lbfgs_n]
-    lbfgs_xn    = X_train_n[lbfgs_idx].to(device)
-    lbfgs_xraw  = X_train_raw[lbfgs_idx].to(device)
-    lbfgs_yn    = Y_train_n[lbfgs_idx].to(device)
+    # Use 512 samples per L-BFGS step — consistent loss surface, manageable memory
+    lbfgs_n    = min(512, len(X_train_n))
+    lbfgs_idx  = torch.randperm(len(X_train_n))[:lbfgs_n]
+    lbfgs_xn   = X_train_n[lbfgs_idx].to(device)
+    lbfgs_xraw = X_train_raw[lbfgs_idx].to(device)
+    lbfgs_yn   = Y_train_n[lbfgs_idx].to(device)
 
     lbfgs_optimizer = torch.optim.LBFGS(
         model.parameters(),
@@ -195,8 +190,7 @@ def train():
         line_search_fn='strong_wolfe'
     )
 
-    lbfgs_epochs    = 50
-    best_lbfgs_loss = float('inf')
+    lbfgs_epochs = 50
 
     for lbfgs_ep in range(1, lbfgs_epochs + 1):
 
@@ -214,7 +208,6 @@ def train():
 
         loss_val = lbfgs_optimizer.step(closure)
 
-        # Validation after each L-BFGS epoch
         model.eval()
         val_accum = 0.0
         with torch.no_grad():
